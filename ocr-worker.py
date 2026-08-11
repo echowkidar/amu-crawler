@@ -141,6 +141,7 @@ def process(job_path):
         cmd = [
             "ocrmypdf",
             "-l", OCR_LANG,
+            "--jobs", "1",
             "--deskew",
             "--rotate-pages",
             "--sidecar", sidecar,
