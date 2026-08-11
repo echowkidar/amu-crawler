@@ -16,11 +16,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     qpdf \
     unpaper \
     pngquant \
-    jbig2 \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir \
-    ocrmypdf \
+    ocrmypdf==17.8.1 \
     pymupdf \
     "psycopg[binary]"
 
@@ -28,6 +27,7 @@ COPY ocr-worker.py /app/ocr-worker.py
 
 RUN python -m py_compile /app/ocr-worker.py && \
     ocrmypdf --version && \
-    tesseract --version | head -1
+    tesseract --version | head -1 && \
+    qpdf --version | head -1
 
 ENTRYPOINT ["python", "-u", "/app/ocr-worker.py"]
