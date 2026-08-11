@@ -176,14 +176,14 @@ def claim_url(kind):
         predicate = """
             (
                 lower(split_part(split_part(url, '?', 1), '#', 1))
-                LIKE '%.pdf'
+                LIKE '%%.pdf'
             )
         """
     else:
         predicate = """
             NOT (
                 lower(split_part(split_part(url, '?', 1), '#', 1))
-                LIKE '%.pdf'
+                LIKE '%%.pdf'
             )
         """
 
@@ -652,20 +652,34 @@ def process_html(row):
 
 def html_loop():
     while True:
-        row = claim_url("html")
-        if not row:
-            time.sleep(POLL_SECONDS)
-            continue
-        process_html(row)
+        try:
+            row = claim_url("html")
+
+            if not row:
+                time.sleep(POLL_SECONDS)
+                continue
+
+            process_html(row)
+
+        except Exception:
+            log.exception("HTML worker exception; continuing")
+            time.sleep(2)
 
 
 def pdf_loop():
     while True:
-        row = claim_url("pdf")
-        if not row:
-            time.sleep(POLL_SECONDS)
-            continue
-        process_pdf(row)
+        try:
+            row = claim_url("pdf")
+
+            if not row:
+                time.sleep(POLL_SECONDS)
+                continue
+
+            process_pdf(row)
+
+        except Exception:
+            log.exception("PDF worker exception; continuing")
+            time.sleep(2)
 
 
 def main():
