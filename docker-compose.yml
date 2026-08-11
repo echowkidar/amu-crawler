@@ -1,0 +1,114 @@
+services:
+
+  # ==========================================================
+  # AMU CRAWLER
+  # Uses the EXISTING PostgreSQL queue and EXISTING corpus.
+  # Nothing here creates a replacement database or corpus.
+  # ==========================================================
+  amu-crawler-v2:
+    build:
+      context: .
+      dockerfile: Dockerfile.crawler
+    image: amu-crawler-v3:production
+    container_name: amu-crawler-v2
+    restart: unless-stopped
+
+    environment:
+      DB_HOST: firecrawl-nuq-postgres
+      DB_PORT: "5432"
+      DB_USER: firecrawl
+      DB_PASSWORD: ""
+      DB_NAME: postgres
+      DB_SCHEMA: amu_crawler
+      DB_TABLE: urls
+
+      FIRECRAWL_URL: http://firecrawl-api:3002
+      FIRECRAWL_TIMEOUT: "180"
+
+      HTML_WORKERS: "12"
+      PDF_WORKERS: "16"
+
+      MAX_RETRIES: "8"
+      STALE_MINUTES: "30"
+      POLL_SECONDS: "1"
+
+      PDF_MIN_TEXT_CHARS: "80"
+
+      ALLOWED_DOMAINS: "amu.ac.in"
+
+      # old.amu.ac.in gets a much more conservative exponential backoff.
+      OLD_BACKOFF_BASE: "10"
+      OLD_BACKOFF_MAX: "900"
+
+      CORPUS: /amu-corpus
+      LOG_LEVEL: INFO
+
+    volumes:
+      - amu-crawler_amu_corpus:/amu-corpus
+
+    networks:
+      - firecrawl-backend
+
+    # Do not set a hard low memory limit. Firecrawl itself is already
+    # using significant RAM on this machine.
+    mem_limit: 8g
+    stop_grace_period: 30s
+
+
+  # ==========================================================
+  # OCR WORKER
+  # Custom image: pip/dependencies are installed at BUILD TIME,
+  # not every time the container starts.
+  # ==========================================================
+  amu-crawler-v2-ocr:
+    build:
+      context: .
+      dockerfile: Dockerfile.ocr
+    image: amu-crawler-ocr:production
+    container_name: amu-crawler-v2-ocr
+    restart: unless-stopped
+
+    environment:
+      DB_HOST: firecrawl-nuq-postgres
+      DB_PORT: "5432"
+      DB_USER: firecrawl
+      DB_PASSWORD: ""
+      DB_NAME: postgres
+      DB_SCHEMA: amu_crawler
+      DB_TABLE: urls
+
+      CORPUS: /amu-corpus
+
+      # Three concurrent OCR jobs. Increase only after observing CPU/RAM.
+      OCR_WORKERS: "3"
+
+      # AMU documents may contain English/Hindi/Urdu.
+      OCR_LANG: "eng+hin+urd"
+
+      OCR_TIMEOUT: "1800"
+      OCR_POLL_SECONDS: "2"
+      LOG_LEVEL: INFO
+
+    volumes:
+      - amu-crawler_amu_corpus:/amu-corpus
+
+    networks:
+      - firecrawl-backend
+
+    mem_limit: 6g
+    stop_grace_period: 30s
+
+
+networks:
+  firecrawl-backend:
+    external: true
+    name: anything_firecrawl-backend
+
+
+volumes:
+  # IMPORTANT:
+  # This is the EXISTING volume confirmed on your machine.
+  # Do NOT remove it.
+  amu-crawler_amu_corpus:
+    external: true
+    name: amu-crawler_amu_corpus
