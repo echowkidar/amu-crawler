@@ -124,7 +124,14 @@ services:
 
       OCR_LANG: "eng+hin+urd"
 
-      OCR_TIMEOUT: "1800"
+      # Render PDF pages at 200 DPI before Tesseract OCR
+      OCR_DPI: "200"
+
+      # Tesseract page segmentation mode
+      OCR_PSM: "6"
+
+      # Maximum time allowed for OCR of one page
+      OCR_PAGE_TIMEOUT: "300"
 
       OCR_POLL_SECONDS: "2"
 
