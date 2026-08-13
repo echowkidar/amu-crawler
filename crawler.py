@@ -619,20 +619,85 @@ def is_discoverable_candidate(url):
         return False
 
 
-def _add_candidate(candidates, base_url, raw_value):
+def resolve_candidate_url(base_url, raw_value):
+    """
+    Safely resolve a discovered URL.
+
+    Absolute URLs are kept absolute; relative URLs are resolved
+    against base_url. Malformed nested URLs such as
+    https://api.amu.ac.in/storage/https://www.youtube.com/...
+    are rejected.
+    """
     if raw_value is None:
-        return
+        return None
+
     value = html_lib.unescape(str(raw_value)).strip()
     value = value.replace("\\/", "/").replace("&quot;", '"')
     value = value.strip().strip('"').strip("'").strip()
-    if not value or value.startswith(("#", "mailto:", "javascript:", "tel:", "data:", "blob:", "about:")):
-        return
+
+    if not value:
+        return None
+
+    if value.lower().startswith((
+        "#", "mailto:", "javascript:", "tel:", "data:",
+        "blob:", "about:"
+    )):
+        return None
+
     if value.startswith(("{{", "[[", "<%", "$")):
-        return
-    new_url = normalize_url(urljoin(base_url, value))
-    if not new_url or not allowed_url(new_url) or not is_discoverable_candidate(new_url):
-        return
-    candidates.add(new_url)
+        return None
+
+    # Absolute URLs must NOT be passed through urljoin(base_url, ...).
+    if re.match(r"^https?://", value, re.IGNORECASE):
+        candidate = value
+
+    # Protocol-relative URL.
+    elif value.startswith("//"):
+        scheme = urlparse(base_url).scheme or "https"
+        candidate = scheme + ":" + value
+
+    # Relative URL.
+    else:
+        candidate = urljoin(base_url, value)
+
+    normalized = normalize_url(candidate)
+    if not normalized:
+        return None
+
+    parsed = urlparse(normalized)
+
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return None
+
+    if parsed.username or parsed.password:
+        return None
+
+    # Reject malformed nested absolute URLs:
+    # /storage/https://www.youtube.com/...
+    remainder = (
+        (parsed.path or "")
+        + "?"
+        + (parsed.query or "")
+    )
+    if re.search(r"https?://", remainder, re.IGNORECASE):
+        return None
+
+    if not allowed_url(normalized):
+        return None
+
+    if not is_discoverable_candidate(normalized):
+        return None
+
+    return normalized
+
+
+def _add_candidate(candidates, base_url, raw_value):
+    new_url = resolve_candidate_url(
+        base_url,
+        raw_value,
+    )
+    if new_url:
+        candidates.add(new_url)
 
 
 def extract_candidate_urls(base_url, html):
