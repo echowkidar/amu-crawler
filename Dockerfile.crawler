@@ -14,7 +14,8 @@ RUN pip install --no-cache-dir \
     "psycopg[binary]"
 
 COPY crawler.py /app/crawler.py
+COPY backfill-discovery.py /app/backfill-discovery.py
 
-RUN python -m py_compile /app/crawler.py
+RUN python -m py_compile /app/crawler.py /app/backfill-discovery.py
 
 ENTRYPOINT ["python", "-u", "/app/crawler.py"]

@@ -3,6 +3,7 @@ import re
 import json
 import time
 import hashlib
+import html as html_lib
 import logging
 import threading
 from datetime import datetime, timezone
@@ -50,6 +51,8 @@ METADATA_DIR = os.path.join(CORPUS, "metadata")
 OCR_DIR = os.path.join(CORPUS, "ocr")
 OCR_QUEUE = os.path.join(OCR_DIR, "queue")
 LOG_DIR = os.path.join(CORPUS, "logs")
+
+TABLE_COLUMNS = set()
 
 ALLOWED_DOMAINS = {
     d.strip().lower()
@@ -136,6 +139,7 @@ def reset_stale_processing():
                     next_retry_at=NOW(),
                     last_error=COALESCE(last_error, 'Recovered stale processing row')
                 WHERE status='processing'
+                  AND COALESCE(last_error, '') <> 'Queued for OCR'
                   AND (
                       last_attempt_at IS NULL OR
                       last_attempt_at < NOW() - (%s * INTERVAL '1 minute')
@@ -564,29 +568,123 @@ def firecrawl_scrape(url):
     return markdown, html, metadata, int(status_code)
 
 
-def discover_links(base_url, html, depth):
-    discovered = 0
+DISCOVERY_SKIP_EXTENSIONS = {
+    ".css", ".js", ".mjs", ".map",
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico", ".bmp", ".tif", ".tiff",
+    ".woff", ".woff2", ".ttf", ".eot", ".otf",
+    ".mp3", ".wav", ".ogg", ".mp4", ".webm", ".avi", ".mov", ".mkv",
+}
+
+DISCOVERY_DIRECT_EXTENSIONS = {
+    ".pdf", ".html", ".htm", ".php", ".asp", ".aspx", ".jsp", ".jspx",
+    ".xhtml", ".json", ".xml", ".txt", ".csv",
+}
+
+DISCOVERY_URL_KEY_RE = re.compile(
+    r"[\"'](?:href|url|link|src|cv|pdf_url|pdf|file|download|path|time_table|timetable|attachment|document_url|routerLink|routerlink|ng-reflect-router-link|data-url|data-href|data-link)[\"']\s*[:=]\s*[\"']([^\"']+)[\"']",
+    re.IGNORECASE,
+)
+
+DISCOVERY_ABSOLUTE_URL_RE = re.compile(
+    r"https?://[^\s\"'<>\\]+",
+    re.IGNORECASE,
+)
+
+DISCOVERY_RELATIVE_PATH_RE = re.compile(
+    r"[\"'](/[^\"'<>\s]+)[\"']"
+)
+
+
+def is_discoverable_candidate(url):
+    try:
+        p = urlparse(url)
+        path = (p.path or "/").lower()
+        ext = os.path.splitext(path)[1]
+        if ext in DISCOVERY_SKIP_EXTENSIONS:
+            return False
+        if ext in DISCOVERY_DIRECT_EXTENSIONS:
+            return True
+        if "/api/" in path:
+            # API JSON endpoints themselves are not the target here; the
+            # embedded JSON is scanned for the actual page/document URLs.
+            # Direct /storage/... document URLs remain allowed below because
+            # they usually have a .pdf or other recognized extension.
+            if p.hostname == "api.amu.ac.in" and path.startswith("/api/"):
+                return False
+            return True
+        if path.startswith(("/assets/", "/static/")):
+            return False
+        return not ext or path.endswith("/")
+    except Exception:
+        return False
+
+
+def _add_candidate(candidates, base_url, raw_value):
+    if raw_value is None:
+        return
+    value = html_lib.unescape(str(raw_value)).strip()
+    value = value.replace("\\/", "/").replace("&quot;", '"')
+    value = value.strip().strip('"').strip("'").strip()
+    if not value or value.startswith(("#", "mailto:", "javascript:", "tel:", "data:", "blob:", "about:")):
+        return
+    if value.startswith(("{{", "[[", "<%", "$")):
+        return
+    new_url = normalize_url(urljoin(base_url, value))
+    if not new_url or not allowed_url(new_url) or not is_discoverable_candidate(new_url):
+        return
+    candidates.add(new_url)
+
+
+def extract_candidate_urls(base_url, html):
+    """Extract crawlable page/document/API URLs without executing JS."""
+    candidates = set()
     if not html:
-        return discovered
+        return candidates
 
     soup = BeautifulSoup(html, "lxml")
-    for a in soup.find_all("a", href=True):
-        href = (a.get("href") or "").strip()
-        if not href or href.startswith((
-            "#", "mailto:", "javascript:", "tel:", "data:"
-        )):
-            continue
+    navigation_attrs = (
+        "href", "src", "routerlink", "routerLink", "ng-reflect-router-link",
+        "data-href", "data-url", "data-link",
+    )
 
-        new_url = normalize_url(urljoin(base_url, href))
-        if not new_url or not allowed_url(new_url):
-            continue
+    for tag in soup.find_all(True):
+        for attr in navigation_attrs:
+            value = tag.get(attr)
+            if value:
+                _add_candidate(candidates, base_url, value)
+        for attr_name, attr_value in tag.attrs.items():
+            if not attr_name.lower().startswith("on") or not isinstance(attr_value, str):
+                continue
+            for m in DISCOVERY_ABSOLUTE_URL_RE.finditer(attr_value):
+                _add_candidate(candidates, base_url, m.group(0))
+            for m in DISCOVERY_RELATIVE_PATH_RE.finditer(attr_value):
+                _add_candidate(candidates, base_url, m.group(1))
 
+    for script in soup.find_all("script"):
+        script_text = script.string or script.get_text() or ""
+        if not script_text:
+            continue
+        for m in DISCOVERY_ABSOLUTE_URL_RE.finditer(script_text):
+            _add_candidate(candidates, base_url, m.group(0))
+        for m in DISCOVERY_URL_KEY_RE.finditer(script_text):
+            _add_candidate(candidates, base_url, m.group(1))
+        for m in DISCOVERY_RELATIVE_PATH_RE.finditer(script_text):
+            _add_candidate(candidates, base_url, m.group(1))
+
+    for m in DISCOVERY_ABSOLUTE_URL_RE.finditer(html):
+        _add_candidate(candidates, base_url, m.group(0))
+
+    return candidates
+
+
+def discover_links(base_url, html, depth):
+    discovered = 0
+    for new_url in sorted(extract_candidate_urls(base_url, html)):
         try:
             if insert_url(new_url, parent_url=base_url, depth=depth + 1):
                 discovered += 1
         except Exception as e:
             log.debug("Discovery insert failed %s: %s", new_url, e)
-
     return discovered
 
 
@@ -682,12 +780,7 @@ def pdf_loop():
             time.sleep(2)
 
 
-def main():
-    for d in [PAGES_DIR, PDF_DIR, METADATA_DIR, OCR_DIR, OCR_QUEUE, LOG_DIR]:
-        os.makedirs(d, exist_ok=True)
-
-    ensure_schema()
-
+def load_table_columns():
     global TABLE_COLUMNS
     with db() as conn:
         with conn.cursor() as cur:
@@ -697,6 +790,16 @@ def main():
                 WHERE table_schema=%s AND table_name=%s
             """, (DB_SCHEMA, DB_TABLE))
             TABLE_COLUMNS = {r[0] for r in cur.fetchall()}
+    return TABLE_COLUMNS
+
+
+def main():
+    for d in [PAGES_DIR, PDF_DIR, METADATA_DIR, OCR_DIR, OCR_QUEUE, LOG_DIR]:
+        os.makedirs(d, exist_ok=True)
+
+    ensure_schema()
+
+    load_table_columns()
 
     log.info("Database columns detected: %s", sorted(TABLE_COLUMNS))
     log.info("=" * 50)
