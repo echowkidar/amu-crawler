@@ -598,23 +598,49 @@ DISCOVERY_RELATIVE_PATH_RE = re.compile(
 def is_discoverable_candidate(url):
     try:
         p = urlparse(url)
+        host = (p.hostname or "").lower()
         path = (p.path or "/").lower()
         ext = os.path.splitext(path)[1]
+
+        # Ignore static assets.
         if ext in DISCOVERY_SKIP_EXTENSIONS:
             return False
+
+        # Directly crawlable document/page types.
         if ext in DISCOVERY_DIRECT_EXTENSIONS:
             return True
-        if "/api/" in path:
-            # API JSON endpoints themselves are not the target here; the
-            # embedded JSON is scanned for the actual page/document URLs.
-            # Direct /storage/... document URLs remain allowed below because
-            # they usually have a .pdf or other recognized extension.
-            if p.hostname == "api.amu.ac.in" and path.startswith("/api/"):
+
+        # ----------------------------------------------------
+        # LMS special cases
+        #
+        # These are session/UI/static endpoints, not useful
+        # crawl targets for the AMU corpus.
+        # ----------------------------------------------------
+        if host == "lms.amu.ac.in":
+            if path.startswith("/theme/switchdevice.php"):
                 return False
+
+            if path.startswith("/theme/image.php"):
+                return False
+
+        # API paths themselves are not crawl targets.
+        # Embedded URLs inside their HTML/JSON are extracted
+        # separately.
+        if "/api/" in path:
+            if (
+                host == "api.amu.ac.in"
+                and path.startswith("/api/")
+            ):
+                return False
+
             return True
+
+        # Ignore common static directories.
         if path.startswith(("/assets/", "/static/")):
             return False
+
         return not ext or path.endswith("/")
+
     except Exception:
         return False
 
