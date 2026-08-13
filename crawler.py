@@ -7,7 +7,7 @@ import html as html_lib
 import logging
 import threading
 from datetime import datetime, timezone
-from urllib.parse import urljoin, urlparse, urldefrag
+from urllib.parse import urljoin, urlparse, urldefrag, unquote
 
 import requests
 import psycopg
@@ -602,19 +602,10 @@ def is_discoverable_candidate(url):
         path = (p.path or "/").lower()
         ext = os.path.splitext(path)[1]
 
-        # Ignore static assets.
-        if ext in DISCOVERY_SKIP_EXTENSIONS:
-            return False
-
-        # Directly crawlable document/page types.
-        if ext in DISCOVERY_DIRECT_EXTENSIONS:
-            return True
-
         # ----------------------------------------------------
-        # LMS special cases
-        #
-        # These are session/UI/static endpoints, not useful
-        # crawl targets for the AMU corpus.
+        # LMS special cases MUST be checked BEFORE the
+        # generic direct-extension check because these are
+        # .php endpoints but are not useful crawl targets.
         # ----------------------------------------------------
         if host == "lms.amu.ac.in":
             if path.startswith("/theme/switchdevice.php"):
@@ -623,9 +614,22 @@ def is_discoverable_candidate(url):
             if path.startswith("/theme/image.php"):
                 return False
 
+        # ----------------------------------------------------
+        # Ignore static assets.
+        # ----------------------------------------------------
+        if ext in DISCOVERY_SKIP_EXTENSIONS:
+            return False
+
+        # ----------------------------------------------------
+        # Directly crawlable document/page types.
+        # ----------------------------------------------------
+        if ext in DISCOVERY_DIRECT_EXTENSIONS:
+            return True
+
+        # ----------------------------------------------------
         # API paths themselves are not crawl targets.
-        # Embedded URLs inside their HTML/JSON are extracted
-        # separately.
+        # Embedded URLs inside JSON/HTML are scanned separately.
+        # ----------------------------------------------------
         if "/api/" in path:
             if (
                 host == "api.amu.ac.in"
@@ -635,9 +639,25 @@ def is_discoverable_candidate(url):
 
             return True
 
+        # ----------------------------------------------------
         # Ignore common static directories.
+        # ----------------------------------------------------
         if path.startswith(("/assets/", "/static/")):
             return False
+
+        # ----------------------------------------------------
+        # Reject URL-encoded fragment-only paths such as:
+        #   /%23
+        #   /%23/
+        # ----------------------------------------------------
+        try:
+            decoded_path = unquote(p.path or "").strip()
+
+            if decoded_path in ("#", "/#"):
+                return False
+
+        except Exception:
+            pass
 
         return not ext or path.endswith("/")
 
@@ -673,6 +693,28 @@ def resolve_candidate_url(base_url, raw_value):
     if value.startswith(("{{", "[[", "<%", "$")):
         return None
 
+    # Reject hash-only / encoded-fragment navigation such as:
+    #   #
+    #   /#
+    #   %23
+    #   /%23
+    try:
+        decoded_value = unquote(value).strip()
+
+        if decoded_value in (
+            "#",
+            "/#",
+            "./#",
+            "../#",
+        ):
+            return None
+
+        if decoded_value.startswith("#"):
+            return None
+
+    except Exception:
+        pass
+
     # Absolute URLs must NOT be passed through urljoin(base_url, ...).
     if re.match(r"^https?://", value, re.IGNORECASE):
         candidate = value
@@ -687,12 +729,28 @@ def resolve_candidate_url(base_url, raw_value):
         candidate = urljoin(base_url, value)
 
     normalized = normalize_url(candidate)
+
     if not normalized:
         return None
 
     parsed = urlparse(normalized)
 
-    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+    # Reject URL-encoded fragment-only navigation after normalization.
+    try:
+        decoded_path = unquote(
+            parsed.path or ""
+        ).strip()
+
+        if decoded_path in ("#", "/#"):
+            return None
+
+    except Exception:
+        pass
+
+    if parsed.scheme not in ("http", "https"):
+        return None
+
+    if not parsed.hostname:
         return None
 
     if parsed.username or parsed.password:
@@ -705,7 +763,12 @@ def resolve_candidate_url(base_url, raw_value):
         + "?"
         + (parsed.query or "")
     )
-    if re.search(r"https?://", remainder, re.IGNORECASE):
+
+    if re.search(
+        r"https?://",
+        remainder,
+        re.IGNORECASE,
+    ):
         return None
 
     if not allowed_url(normalized):
@@ -722,6 +785,7 @@ def _add_candidate(candidates, base_url, raw_value):
         base_url,
         raw_value,
     )
+
     if new_url:
         candidates.add(new_url)
 
