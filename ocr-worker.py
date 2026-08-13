@@ -4,8 +4,9 @@ import json
 import time
 import subprocess
 import logging
+import threading
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import psycopg
 import fitz
@@ -44,27 +45,31 @@ OCR_WORKERS = int(os.getenv("OCR_WORKERS", "1"))
 
 OCR_LANG = os.getenv(
     "OCR_LANG",
-    "eng+hin+urd"
+    "eng+hin+urd",
 )
 
 OCR_DPI = int(
-    os.getenv("OCR_DPI", "200")
+    os.getenv("OCR_DPI", "200"),
 )
 
 OCR_PSM = int(
-    os.getenv("OCR_PSM", "6")
+    os.getenv("OCR_PSM", "6"),
 )
 
 OCR_PAGE_TIMEOUT = int(
-    os.getenv("OCR_PAGE_TIMEOUT", "300")
+    os.getenv("OCR_PAGE_TIMEOUT", "300"),
 )
 
 OCR_POLL_SECONDS = float(
-    os.getenv("OCR_POLL_SECONDS", "2")
+    os.getenv("OCR_POLL_SECONDS", "2"),
 )
 
 MAX_RETRIES = int(
-    os.getenv("MAX_RETRIES", "8")
+    os.getenv("MAX_RETRIES", "8"),
+)
+
+OCR_RETRY_DELAY = int(
+    os.getenv("OCR_RETRY_DELAY", "30"),
 )
 
 
@@ -81,17 +86,13 @@ log = logging.getLogger("amu-ocr")
 
 
 # ==========================================================
-# DATABASE HELPERS
+# DB
 # ==========================================================
 
 def qname():
-    return (
-        '"'
-        + DB_SCHEMA.replace('"', '""')
-        + '"."'
-        + DB_TABLE.replace('"', '""')
-        + '"'
-    )
+    schema = DB_SCHEMA.replace('"', '""')
+    table = DB_TABLE.replace('"', '""')
+    return f'"{schema}"."{table}"'
 
 
 def db():
@@ -106,17 +107,12 @@ def db():
 
 
 # ==========================================================
-# DATABASE STATUS UPDATE
+# DATABASE - SUCCESS
 # ==========================================================
 
-def update_completed(row_id):
-    """
-    Mark OCR job completed.
-    """
-
+def mark_completed(row_id):
     with db() as conn:
         with conn.cursor() as cur:
-
             cur.execute(
                 f"""
                 UPDATE {qname()}
@@ -129,18 +125,24 @@ def update_completed(row_id):
                 """,
                 (row_id,),
             )
-
         conn.commit()
 
 
-def update_failed(row_id, error):
-    """
-    Handle OCR failure.
+# ==========================================================
+# DATABASE - FAILURE / RETRY
+# ==========================================================
 
-    IMPORTANT:
-    - Retry count is incremented here.
-    - If retry limit is reached -> permanently failed.
-    - Otherwise job becomes pending with a future retry time.
+def mark_failed_or_retry(row_id, error):
+    """
+    Increment retry_count.
+
+    retry_count < MAX_RETRIES:
+        status = pending
+        next_retry_at = now + OCR_RETRY_DELAY
+
+    retry_count >= MAX_RETRIES:
+        status = failed
+        next_retry_at = NULL
     """
 
     with db() as conn:
@@ -148,104 +150,179 @@ def update_failed(row_id, error):
 
             cur.execute(
                 f"""
-                UPDATE {qname()}
-                SET
-                    status = CASE
-                        WHEN COALESCE(retry_count, 0) + 1 >= %s
-                        THEN 'failed'
-                        ELSE 'pending'
-                    END,
-
-                    retry_count =
-                        COALESCE(retry_count, 0) + 1,
-
-                    last_error = %s,
-
-                    next_retry_at = CASE
-                        WHEN COALESCE(retry_count, 0) + 1 >= %s
-                        THEN NULL
-                        ELSE NOW() + INTERVAL '30 seconds'
-                    END
-
+                SELECT COALESCE(retry_count, 0)
+                FROM {qname()}
                 WHERE id = %s
-
-                RETURNING
-                    status,
-                    retry_count,
-                    next_retry_at
                 """,
-                (
-                    MAX_RETRIES,
-                    error,
-                    MAX_RETRIES,
-                    row_id,
-                ),
+                (row_id,),
             )
 
             row = cur.fetchone()
 
+            current_retry = int(row[0]) if row else 0
+            new_retry = current_retry + 1
+
+            if new_retry >= MAX_RETRIES:
+
+                cur.execute(
+                    f"""
+                    UPDATE {qname()}
+                    SET
+                        status = 'failed',
+                        retry_count = %s,
+                        last_error = %s,
+                        next_retry_at = NULL
+                    WHERE id = %s
+                    """,
+                    (
+                        new_retry,
+                        error,
+                        row_id,
+                    ),
+                )
+
+                status = "failed"
+                next_retry_at = None
+
+            else:
+
+                next_retry_at = (
+                    datetime.now(timezone.utc)
+                    + timedelta(seconds=OCR_RETRY_DELAY)
+                )
+
+                cur.execute(
+                    f"""
+                    UPDATE {qname()}
+                    SET
+                        status = 'pending',
+                        retry_count = %s,
+                        last_error = %s,
+                        next_retry_at = %s
+                    WHERE id = %s
+                    """,
+                    (
+                        new_retry,
+                        error,
+                        next_retry_at,
+                        row_id,
+                    ),
+                )
+
+                status = "pending"
+
         conn.commit()
 
-    if row:
-        status = row[0]
-        retry_count = int(row[1])
-        next_retry = row[2]
-
-        if status == "failed":
-
-            log.error(
-                "OCR PERMANENTLY FAILED | id=%s | retries=%d | error=%s",
-                row_id,
-                retry_count,
-                error,
-            )
-
-        else:
-
-            log.warning(
-                "OCR RETRY SCHEDULED | id=%s | retry=%d/%d | next=%s",
-                row_id,
-                retry_count,
-                MAX_RETRIES,
-                next_retry,
-            )
+    return status, new_retry, next_retry_at
 
 
 # ==========================================================
-# STALE PROCESSING JOB RECOVERY
+# STALE JOB RECOVERY
 # ==========================================================
 
 def recover_processing_jobs():
+    """
+    On startup, recover previous .json.processing files.
+
+    These are assumed to be abandoned jobs from an earlier
+    worker process/container shutdown.
+    """
 
     recovered = 0
 
-    for p in glob.glob(
+    for path in glob.glob(
         os.path.join(QUEUE, "*.json.processing")
     ):
 
-        target = p[:-11]
+        target = path[:-11]
 
         try:
-
-            os.replace(p, target)
+            os.replace(path, target)
             recovered += 1
 
         except FileNotFoundError:
             continue
 
         except OSError as e:
-
             log.warning(
-                "Could not recover processing job %s: %s",
-                p,
+                "Could not recover %s: %s",
+                path,
                 e,
             )
 
     if recovered:
-
         log.info(
             "Recovered %d stale OCR processing jobs",
             recovered,
+        )
+
+
+# ==========================================================
+# RETRY FILE PROMOTION
+# ==========================================================
+
+def promote_retry_jobs():
+    """
+    Retry files use:
+
+        *.json.retry
+
+    Their filesystem mtime is the retry eligibility time.
+
+    Once OCR_RETRY_DELAY has elapsed they are moved back to:
+
+        *.json
+    """
+
+    while True:
+
+        try:
+
+            now = time.time()
+
+            for path in glob.glob(
+                os.path.join(QUEUE, "*.json.retry")
+            ):
+
+                try:
+
+                    mtime = os.path.getmtime(path)
+
+                    if now - mtime < OCR_RETRY_DELAY:
+                        continue
+
+                    target = path[:-6]
+
+                    os.replace(
+                        path,
+                        target,
+                    )
+
+                    log.info(
+                        "Retrying OCR job: %s",
+                        os.path.basename(target),
+                    )
+
+                except FileNotFoundError:
+                    continue
+
+                except OSError as e:
+                    log.warning(
+                        "Retry promotion failed %s: %s",
+                        path,
+                        e,
+                    )
+
+        except Exception:
+            log.exception(
+                "Unexpected retry promoter error"
+            )
+
+        time.sleep(
+            min(
+                2.0,
+                OCR_RETRY_DELAY,
+            )
         )
 
 
@@ -269,17 +346,15 @@ def claim_job():
 
             os.replace(
                 job,
-                processing
+                processing,
             )
 
             return processing
 
         except FileNotFoundError:
-
             continue
 
         except OSError:
-
             continue
 
     return None
@@ -299,12 +374,11 @@ def atomic_write(path, text):
         encoding="utf-8",
         errors="replace",
     ) as f:
-
         f.write(text)
 
     os.replace(
         tmp,
-        path
+        path,
     )
 
 
@@ -315,11 +389,12 @@ def atomic_write(path, text):
 def ocr_page(page, page_number, total_pages):
 
     """
-    Render one PDF page and run Tesseract.
+    Render one page and run Tesseract.
 
-    Rendering is done at configured DPI.
+    Returns ONLY actual OCR text.
 
-    OCR timeout protects worker from a single pathological page.
+    Page markers are NOT returned here and therefore can never
+    inflate the OCR character count.
     """
 
     pix = page.get_pixmap(
@@ -361,9 +436,7 @@ def ocr_page(page, page_number, total_pages):
         )
 
         text = (
-            result.stdout
-            if result.stdout
-            else ""
+            result.stdout or ""
         ).strip()
 
         elapsed = time.time() - start
@@ -384,12 +457,13 @@ def ocr_page(page, page_number, total_pages):
 
         try:
             os.remove(image_path)
+
         except FileNotFoundError:
             pass
 
 
 # ==========================================================
-# PROCESS PDF
+# PROCESS OCR JOB
 # ==========================================================
 
 def process(job_path):
@@ -399,7 +473,6 @@ def process(job_path):
         "r",
         encoding="utf-8",
     ) as f:
-
         job = json.load(f)
 
     row_id = job["id"]
@@ -407,7 +480,7 @@ def process(job_path):
     h = job["hash"]
     pdf = job["pdf"]
 
-    sidecar = os.path.join(
+    txt_path = os.path.join(
         OCR_DIR,
         h + ".txt",
     )
@@ -460,11 +533,15 @@ def process(job_path):
                 OCR_DPI,
             )
 
-            all_text = []
+            # --------------------------------------------------
+            # IMPORTANT:
+            #
+            # page_sections contains formatting markers.
+            # actual_chars counts ONLY OCR text.
+            # --------------------------------------------------
 
-            # --------------------------------------------------
-            # PAGE BY PAGE OCR
-            # --------------------------------------------------
+            page_sections = []
+            actual_chars = 0
 
             for page_number in range(
                 1,
@@ -475,15 +552,19 @@ def process(job_path):
                     page_number - 1
                 ]
 
-                text = ocr_page(
+                page_text = ocr_page(
                     page,
                     page_number,
                     total_pages,
                 )
 
-                all_text.append(
+                actual_chars += len(
+                    page_text
+                )
+
+                page_sections.append(
                     f"--- PAGE {page_number} ---\n\n"
-                    f"{text}\n"
+                    f"{page_text}\n"
                 )
 
         finally:
@@ -491,29 +572,32 @@ def process(job_path):
             doc.close()
 
         # --------------------------------------------------
-        # COMBINE OCR
+        # FINAL OCR TEXT
         # --------------------------------------------------
 
         text = "\n".join(
-            all_text
+            page_sections
         ).strip()
 
         # --------------------------------------------------
-        # EMPTY OCR
+        # CRITICAL EMPTY OCR CHECK
+        #
+        # Do NOT use len(text) here because page markers
+        # themselves are text.
         # --------------------------------------------------
 
-        if not text:
+        if actual_chars <= 0:
 
             raise RuntimeError(
                 "OCR produced empty text"
             )
 
         # --------------------------------------------------
-        # SAVE OCR TEXT
+        # SAVE TXT
         # --------------------------------------------------
 
         atomic_write(
-            sidecar,
+            txt_path,
             text + "\n",
         )
 
@@ -528,7 +612,7 @@ def process(job_path):
 
             "Document type: Scanned/OCR PDF\n\n"
 
-            f"OCR engine: Tesseract\n\n"
+            "OCR engine: Tesseract\n\n"
 
             f"OCR language: {OCR_LANG}\n\n"
 
@@ -537,6 +621,8 @@ def process(job_path):
             f"OCR PSM: {OCR_PSM}\n\n"
 
             f"Pages: {total_pages}\n\n"
+
+            f"Actual OCR characters: {actual_chars}\n\n"
 
             "---\n\n"
 
@@ -553,29 +639,18 @@ def process(job_path):
         # --------------------------------------------------
 
         metadata = {
-
             "url": url,
-
             "type": "pdf",
-
             "ocr": True,
-
             "ocr_engine": "Tesseract",
-
             "language": OCR_LANG,
-
             "dpi": OCR_DPI,
-
             "psm": OCR_PSM,
-
             "pages": total_pages,
-
-            "characters": len(text),
-
-            "completed_at":
-                datetime.now(
-                    timezone.utc
-                ).isoformat(),
+            "characters": actual_chars,
+            "completed_at": datetime.now(
+                timezone.utc
+            ).isoformat(),
         }
 
         atomic_write(
@@ -588,32 +663,30 @@ def process(job_path):
         )
 
         # --------------------------------------------------
-        # DATABASE SUCCESS
+        # DATABASE COMPLETE
         # --------------------------------------------------
 
-        update_completed(
+        mark_completed(
             row_id
         )
 
         # --------------------------------------------------
-        # REMOVE PROCESSING FILE
+        # REMOVE PROCESSING JOB
         # --------------------------------------------------
 
         try:
-
             os.remove(
                 job_path
             )
 
         except FileNotFoundError:
-
             pass
 
         log.info(
             "OCR COMPLETED: %s | pages=%d | chars=%d",
             url,
             total_pages,
-            len(text),
+            actual_chars,
         )
 
     except Exception as e:
@@ -630,40 +703,94 @@ def process(job_path):
         )
 
         # --------------------------------------------------
-        # DATABASE FAILURE / RETRY
+        # UPDATE DATABASE
         # --------------------------------------------------
 
         try:
 
-            update_failed(
-                row_id,
-                error,
+            status, retry_count, next_retry_at = (
+                mark_failed_or_retry(
+                    row_id,
+                    error,
+                )
             )
 
         except Exception:
 
             log.exception(
-                "Failed to update database for OCR job id=%s",
+                "Database failure while updating OCR job %s",
                 row_id,
             )
 
+            status = "pending"
+            retry_count = None
+            next_retry_at = None
+
         # --------------------------------------------------
+        # MAX RETRIES REACHED
+        # --------------------------------------------------
+
+        if status == "failed":
+
+            try:
+                os.remove(
+                    job_path
+                )
+
+            except FileNotFoundError:
+                pass
+
+            log.error(
+                "OCR PERMANENTLY FAILED | id=%s | retries=%s",
+                row_id,
+                retry_count,
+            )
+
+            return
+
+        # --------------------------------------------------
+        # RETRY
+        #
         # IMPORTANT:
+        # Do NOT return immediately as *.json.
         #
-        # DO NOT PUT FAILED JOB BACK INTO QUEUE.
+        # Otherwise the same job can be picked up again
+        # immediately and create an infinite retry loop.
         #
-        # This prevents the previous infinite retry loop.
+        # Put it into *.json.retry and let the retry promoter
+        # release it after OCR_RETRY_DELAY.
         # --------------------------------------------------
+
+        retry_path = (
+            job_path[:-11]
+            + ".json.retry"
+            if job_path.endswith(".json.processing")
+            else job_path + ".retry"
+        )
 
         try:
 
-            os.remove(
-                job_path
+            os.replace(
+                job_path,
+                retry_path,
+            )
+
+            log.warning(
+                "OCR RETRY WAIT | id=%s | retry=%s/%s | delay=%ss",
+                row_id,
+                retry_count,
+                MAX_RETRIES,
+                OCR_RETRY_DELAY,
             )
 
         except FileNotFoundError:
-
             pass
+
+        except Exception:
+
+            log.exception(
+                "Could not move failed OCR job to retry queue"
+            )
 
 
 # ==========================================================
@@ -686,7 +813,9 @@ def worker_loop():
 
         try:
 
-            process(job)
+            process(
+                job
+            )
 
         except Exception:
 
@@ -703,7 +832,7 @@ def worker_loop():
 
 def main():
 
-    for d in [
+    for directory in [
         QUEUE,
         PAGES_DIR,
         OCR_DIR,
@@ -711,10 +840,12 @@ def main():
     ]:
 
         os.makedirs(
-            d,
+            directory,
             exist_ok=True,
         )
 
+    # Recover jobs left as .processing after
+    # container crash/restart.
     recover_processing_jobs()
 
     log.info(
@@ -746,6 +877,21 @@ def main():
     )
 
     log.info(
+        "Page timeout = %ds",
+        OCR_PAGE_TIMEOUT,
+    )
+
+    log.info(
+        "Retry delay = %ds",
+        OCR_RETRY_DELAY,
+    )
+
+    log.info(
+        "Max retries = %d",
+        MAX_RETRIES,
+    )
+
+    log.info(
         "Queue = %s",
         QUEUE,
     )
@@ -753,6 +899,16 @@ def main():
     log.info(
         "=" * 50
     )
+
+    # Retry promoter is lightweight and only checks
+    # *.json.retry files.
+    retry_thread = threading.Thread(
+        target=promote_retry_jobs,
+        name="ocr-retry",
+        daemon=True,
+    )
+
+    retry_thread.start()
 
     with ThreadPoolExecutor(
         max_workers=OCR_WORKERS,
@@ -769,9 +925,10 @@ def main():
 
         while True:
 
-            time.sleep(3600)
+            time.sleep(
+                3600
+            )
 
 
 if __name__ == "__main__":
-
     main()
