@@ -64,6 +64,21 @@ OCR_POLL_SECONDS = float(
     os.getenv("OCR_POLL_SECONDS", "2"),
 )
 
+# ----------------------------------------------------------
+# OCR WATCHDOG
+# ----------------------------------------------------------
+
+OCR_WATCHDOG_ENABLED = (
+    os.getenv("OCR_WATCHDOG_ENABLED", "1") == "1"
+)
+
+OCR_WATCHDOG_INTERVAL = int(
+    os.getenv("OCR_WATCHDOG_INTERVAL", "60")
+)
+
+OCR_WATCHDOG_STALE_MINUTES = int(
+    os.getenv("OCR_WATCHDOG_STALE_MINUTES", "15")
+)
 MAX_RETRIES = int(
     os.getenv("MAX_RETRIES", "8"),
 )
@@ -84,6 +99,43 @@ logging.basicConfig(
 
 log = logging.getLogger("amu-ocr")
 
+# ==========================================================
+# OCR WATCHDOG STATE
+# ==========================================================
+
+heartbeat_lock = threading.Lock()
+
+last_progress_at = time.time()
+active_job_path = None
+active_job_started_at = None
+
+
+def mark_worker_progress():
+    global last_progress_at
+
+    with heartbeat_lock:
+        last_progress_at = time.time()
+
+
+def set_active_job(job_path):
+    global active_job_path
+    global active_job_started_at
+
+    with heartbeat_lock:
+        active_job_path = job_path
+        active_job_started_at = time.time()
+        last_progress_at = time.time()
+
+
+def clear_active_job():
+    global active_job_path
+    global active_job_started_at
+    global last_progress_at
+
+    with heartbeat_lock:
+        active_job_path = None
+        active_job_started_at = None
+        last_progress_at = time.time()
 
 # ==========================================================
 # DB
@@ -441,6 +493,8 @@ def ocr_page(page, page_number, total_pages):
 
         elapsed = time.time() - start
 
+        mark_worker_progress()
+        
         log.info(
             "OCR PAGE: %s/%s | size=%sx%s | chars=%d | %.1fs",
             page_number,
@@ -450,6 +504,7 @@ def ocr_page(page, page_number, total_pages):
             len(text),
             elapsed,
         )
+        
 
         return text
 
@@ -797,6 +852,122 @@ def process(job_path):
 # WORKER LOOP
 # ==========================================================
 
+# ==========================================================
+# OCR WATCHDOG
+# ==========================================================
+
+def watchdog_loop():
+
+    log.info(
+        "OCR watchdog enabled=%s interval=%ss stale=%sm",
+        OCR_WATCHDOG_ENABLED,
+        OCR_WATCHDOG_INTERVAL,
+        OCR_WATCHDOG_STALE_MINUTES,
+    )
+
+    while True:
+
+        try:
+
+            if not OCR_WATCHDOG_ENABLED:
+                time.sleep(
+                    OCR_WATCHDOG_INTERVAL
+                )
+                continue
+
+            with heartbeat_lock:
+                progress_at = last_progress_at
+                job_path = active_job_path
+                job_started_at = active_job_started_at
+
+            # ------------------------------------------------
+            # Nothing active.
+            # ------------------------------------------------
+            if not job_path:
+
+                time.sleep(
+                    OCR_WATCHDOG_INTERVAL
+                )
+
+                continue
+
+            now = time.time()
+
+            stale_seconds = (
+                OCR_WATCHDOG_STALE_MINUTES * 60
+            )
+
+            no_progress_for = (
+                now - progress_at
+            )
+
+            job_age = (
+                now - job_started_at
+                if job_started_at
+                else 0
+            )
+
+            # ------------------------------------------------
+            # Worker is healthy.
+            # ------------------------------------------------
+            if no_progress_for < stale_seconds:
+
+                time.sleep(
+                    OCR_WATCHDOG_INTERVAL
+                )
+
+                continue
+
+            # ------------------------------------------------
+            # Worker appears stuck.
+            #
+            # IMPORTANT:
+            # Do NOT rename/delete .processing here.
+            #
+            # Exit the container instead. Docker's
+            # restart: unless-stopped will restart it and
+            # recover_processing_jobs() will safely recover
+            # the abandoned job.
+            # ------------------------------------------------
+
+            processing_count = len(
+                glob.glob(
+                    os.path.join(
+                        QUEUE,
+                        "*.json.processing"
+                    )
+                )
+            )
+
+            log.error(
+                "OCR WATCHDOG: no progress for %.1f minutes | "
+                "job_age=%.1f minutes | processing_files=%d | "
+                "job=%s | restarting worker",
+                no_progress_for / 60,
+                job_age / 60,
+                processing_count,
+                os.path.basename(job_path),
+            )
+
+            # Give the log a moment to flush.
+            for handler in logging.getLogger().handlers:
+                try:
+                    handler.flush()
+                except Exception:
+                    pass
+
+            os._exit(1)
+
+        except Exception:
+
+            log.exception(
+                "Unexpected OCR watchdog error"
+            )
+
+        time.sleep(
+            OCR_WATCHDOG_INTERVAL
+        )
+
 def worker_loop():
 
     while True:
@@ -811,11 +982,11 @@ def worker_loop():
 
             continue
 
+        set_active_job(job)
+
         try:
 
-            process(
-                job
-            )
+            process(job)
 
         except Exception:
 
@@ -824,6 +995,10 @@ def worker_loop():
             )
 
             time.sleep(1)
+
+        finally:
+
+            clear_active_job()
 
 
 # ==========================================================
@@ -909,7 +1084,16 @@ def main():
     )
 
     retry_thread.start()
+    
+    if OCR_WATCHDOG_ENABLED:
 
+        watchdog_thread = threading.Thread(
+            target=watchdog_loop,
+            name="ocr-watchdog",
+            daemon=True,
+        )
+
+        watchdog_thread.start()
     with ThreadPoolExecutor(
         max_workers=OCR_WORKERS,
         thread_name_prefix="ocr",
